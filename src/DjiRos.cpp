@@ -28,7 +28,6 @@ DjiRos::DjiRos(ros::NodeHandle& nh)
       sdk_control_flag(false),
       m_verbose_output(false),
       m_hwsync_ack_count(0) {
-    
     std::string log_level_str;
     nh.param("log_level", log_level_str, std::string("info"));
     if ("debug" == log_level_str) {
@@ -40,7 +39,7 @@ DjiRos::DjiRos(ros::NodeHandle& nh)
         ROS_ERROR("Only support log_level_str in (\"debug\",\"info\"), using debug as default");
         ros::console::set_logger_level(ROSCONSOLE_DEFAULT_NAME, ros::console::levels::Debug);
     }
-    
+
     std::string serial_name;
     int baud_rate;
     int app_id;
@@ -50,6 +49,8 @@ DjiRos::DjiRos(ros::NodeHandle& nh)
 
     int uart_or_usb;
     int A3_or_M100;
+    bool use_imu_filter;
+
     nh.param("serial_name", serial_name, std::string("/dev/null"));
     nh.param("baud_rate", baud_rate, 230400);
     nh.param("app_id", app_id, 0);
@@ -62,6 +63,7 @@ DjiRos::DjiRos(ros::NodeHandle& nh)
     nh.param("only_broadcast",
              only_broadcast,
              false);  // broadcast mode, no control signal send to sdk
+    nh.param("use_imu_filter", use_imu_filter, false);
     nh.param("align_with_fmu",
              align_with_fmu,
              false);  // Where djiros will use ticks from fmu to align with it
@@ -112,7 +114,7 @@ DjiRos::DjiRos(ros::NodeHandle& nh)
     // ros related initialization
     ros_R_fc << 1, 0, 0, 0, -1, 0, 0, 0, -1;
 
-    pub_imu = nh.advertise<sensor_msgs::Imu>("imu", 10);
+    pub_imu = nh.advertise<sensor_msgs::Imu>("imu_raw", 10);
     pub_velo = nh.advertise<geometry_msgs::Vector3Stamped>("velo", 10);
     pub_gps = nh.advertise<sensor_msgs::NavSatFix>("gps", 10);
     pub_gps_odom = nh.advertise<nav_msgs::Odometry>("gps_odom", 10);
@@ -139,6 +141,11 @@ DjiRos::DjiRos(ros::NodeHandle& nh)
             boost::bind(&DjiRos::gimbal_speed_control_callback, this, _1),
             ros::VoidConstPtr(),
             ros::TransportHints().tcpNoDelay());
+    }
+
+    if (use_imu_filter) {
+        imu_filter = std::make_shared<IMUFilter>();
+        imu_filter->pub = nh.advertise<sensor_msgs::Imu>("imu_filtered", 10);
     }
 
     if (!only_broadcast && !sdk.activate(&user_act_data)) {
@@ -172,8 +179,7 @@ DjiRos::~DjiRos() {
 void DjiRos::process() {
     ros::Time now_time = ros::Time::now();
 
-    if(m_hwsync.get())
-    {
+    if (m_hwsync.get()) {
         // read queue and send request to API
         std::lock_guard<std::mutex> lg(m_hwsync->req_mutex);
 
@@ -361,6 +367,11 @@ void DjiRos::on_broadcast() {
         imu_msg.linear_acceleration.z = -a_b(2);
 
         pub_imu.publish(imu_msg);
+
+        // Filter related code
+        if (imu_filter.get()) {
+            imu_filter->process(imu_msg);
+        }
     }
 
     if ((msg_flags & DTFlag.HAS_V)) {
@@ -437,7 +448,7 @@ void DjiRos::on_broadcast() {
         rc_msg.axes.push_back(static_cast<float>(bc_data.rc.yaw / 10000.0));
         rc_msg.axes.push_back(static_cast<float>(bc_data.rc.throttle / 10000.0));
         rc_msg.axes.push_back(static_cast<float>(-bc_data.rc.mode / 10000.0));
-        rc_msg.axes.push_back(static_cast<float>((-bc_data.rc.gear-15000) / 10000.0));
+        rc_msg.axes.push_back(static_cast<float>((-bc_data.rc.gear - 15000) / 10000.0));
 
         rc_msg.buttons.push_back(static_cast<int>(bc_data.status));
         rc_msg.buttons.push_back(static_cast<int>(bc_data.battery));
@@ -463,28 +474,27 @@ void DjiRos::on_broadcast() {
 
     if ((msg_flags & DTFlag.HAS_TIME)) {
         static ros::Time last_time_ref(0.0);
-        
+
         sensor_msgs::TimeReference tmr_msg;
         tmr_msg.header.stamp = msg_stamp;
         tmr_msg.time_ref = ros::Time(static_cast<double>(bc_data.timeStamp.time));
         tmr_msg.source = std::string("from fmu, 400 ticks/sec");
         pub_time_ref.publish(tmr_msg);
-        
-        ROS_DEBUG("stamp dt = %.3f, tick=%d", 
-                 (tmr_msg.time_ref - last_time_ref).toSec(), 
-                 bc_data.timeStamp.time);
-        last_time_ref = tmr_msg.time_ref;
 
+        ROS_DEBUG("stamp dt = %.3f, tick=%d",
+                  (tmr_msg.time_ref - last_time_ref).toSec(),
+                  bc_data.timeStamp.time);
+        last_time_ref = tmr_msg.time_ref;
     }
 
     if ((msg_flags & DTFlag.HAS_TIME) && bc_data.timeStamp.syncFlag) {
         ROS_DEBUG("sdk recv sync:%d #%d @ %d.%d",
-                 bc_data.timeStamp.syncFlag,
-                 m_hwsync_ack_count,
-                 msg_stamp.sec, msg_stamp.nsec);
+                  bc_data.timeStamp.syncFlag,
+                  m_hwsync_ack_count,
+                  msg_stamp.sec,
+                  msg_stamp.nsec);
 
-        if(m_hwsync.get())
-        {
+        if (m_hwsync.get()) {
             std::lock_guard<std::mutex> lg(m_hwsync->ack_mutex);
             m_hwsync->ack_queue.emplace(msg_stamp, m_hwsync_ack_count);
         }
@@ -539,8 +549,8 @@ void DjiRos::control_callback(const sensor_msgs::JoyConstPtr& pMsg) {
         flight_ctrl_data.yaw = pMsg->axes[3];
         if (pMsg->axes[4] > 0) {
             flight_ctrl_data.flag = 0b00100010;  // 0b00100000, mode 13
-            if (pMsg->axes.size()>5 && pMsg->axes.at(5)>0.5) {
-                flight_ctrl_data.flag = 0b00101010; // 0b00100000, mode 14
+            if (pMsg->axes.size() > 5 && pMsg->axes.at(5) > 0.5) {
+                flight_ctrl_data.flag = 0b00101010;  // 0b00100000, mode 14
             }
         } else {
             flight_ctrl_data.flag = 0b00000010;  // 0b00000000, mode 1
@@ -593,4 +603,50 @@ void DjiRos::gimbal_speed_control_callback(const geometry_msgs::TwistStampedCons
     gimbal_speed.reserved = 0x80;  // little endian. enable
 
     sdk.camera->setGimbalSpeed(&gimbal_speed);
+}
+
+IMUFilter::IMUFilter()
+    : prepared(false),
+      last_stamp(0.0){
+
+      };
+
+void IMUFilter::process(const sensor_msgs::Imu& msg_in) {
+    if (!prepared) {
+        if (last_stamp > ros::Time(0.0)) {
+            double dt = (msg_in.header.stamp - last_stamp).toSec();
+            for (size_t i = 0; i < 3; ++i) {
+                accel_filters[i].verify_sample_rate(dt);
+                gyro_filters[i].verify_sample_rate(dt);
+            }
+            ROS_INFO("[djiros] IMUFilter prepared");
+            prepared = true;
+        }
+        last_stamp = msg_in.header.stamp;
+    } else {  // Prepared
+        sensor_msgs::Imu msg_out;
+        msg_out.header = msg_in.header;
+        msg_out.orientation = msg_in.orientation;
+
+        stamp_buf.push_front(msg_in.header.stamp);
+        ROS_ASSERT(accel_filters[0].avg_delay > 0);
+        while (stamp_buf.size() > static_cast<size_t>(accel_filters[0].avg_delay)) {
+            stamp_buf.pop_back();
+        }
+
+        bool valid_output = true;
+        /* clang-format off */
+        valid_output &= accel_filters[0].update(msg_in.linear_acceleration.x, msg_out.linear_acceleration.x);
+        valid_output &= accel_filters[1].update(msg_in.linear_acceleration.y, msg_out.linear_acceleration.y);
+        valid_output &= accel_filters[2].update(msg_in.linear_acceleration.z, msg_out.linear_acceleration.z);
+        valid_output &= gyro_filters[0].update(msg_in.angular_velocity.x, msg_out.angular_velocity.x);
+        valid_output &= gyro_filters[1].update(msg_in.angular_velocity.y, msg_out.angular_velocity.y);
+        valid_output &= gyro_filters[2].update(msg_in.angular_velocity.z, msg_out.angular_velocity.z);
+        /* clang-format on */
+
+        if (valid_output && stamp_buf.size() == static_cast<size_t>(accel_filters[0].avg_delay)) {
+            msg_out.header.stamp = stamp_buf.back();
+            pub.publish(msg_out);
+        }
+    }
 }

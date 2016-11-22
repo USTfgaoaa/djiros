@@ -50,7 +50,8 @@
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
 #include <list>
-#include <string.h>
+#include <array>
+#include <cstring>
 
 // ros includes
 #include <ros/ros.h>
@@ -66,6 +67,7 @@
 
 #include "DjiSdkRosAdapter.h"
 #include "HardwareSync.h"
+#include "ButterWorthFilter.hpp"
 
 #define ASSERT_EQUALITY(x, y) ROS_ASSERT_MSG((x) == (y), "_1:%d _2:%d", (int)x, (int)y);
 
@@ -210,6 +212,20 @@ struct AlignData_t {
     AlignData_t(ros::Time _time, uint32_t _tick) : time(_time), tick(_tick){};
 };
 
+class IMUFilter {
+public:
+    ros::Publisher pub;
+    IMUFilter();
+    void process(const sensor_msgs::Imu& msg_in);
+private:
+    bool prepared;
+    ros::Time last_stamp;
+    std::array<ButterWorthFilter, 3> accel_filters;
+    std::array<ButterWorthFilter, 3> gyro_filters;
+    std::deque<ros::Time> stamp_buf;
+
+};
+
 class DjiRos {
   private:
     // ros publishers and subsribers
@@ -240,6 +256,8 @@ class DjiRos {
     double gravity;
     Eigen::Matrix3d ros_R_fc;
     bool only_broadcast;
+    
+    std::shared_ptr<IMUFilter> imu_filter;
 
     // align related variables
     enum struct AlignState_t { unaligned, aligning, aligned };
